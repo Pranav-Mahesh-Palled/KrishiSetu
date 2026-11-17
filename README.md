@@ -232,15 +232,41 @@ KrishiSetu is configured via environment variables. See [`.env.example`](.env.ex
 
 ---
 
-## 🐳 7. Docker & Production Deployment
+## 🐳 7. Production Deployment (Render & Docker)
 
-### Docker Multi-Stage Build
-The project includes a production-ready, multi-stage [Dockerfile](Dockerfile):
-- **Stage 1 (`node:20-alpine`):** Installs frontend dependencies and compiles static assets into `frontend/dist`.
-- **Stage 2 (`python:3.11-slim`):** Installs Python packages, copies backend application code and compiled frontend assets, and starts Uvicorn.
+### Primary Deployment: Render Blueprint (Docker Web Service)
+The repository includes a validated [`render.yaml`](render.yaml) specification that configures a zero-downtime, single-URL Web Service on Render using the multi-stage root [`Dockerfile`](Dockerfile):
+
+- **Runtime:** `runtime: docker`
+- **Build Path:** `dockerfilePath: ./Dockerfile`
+- **Plan:** Free tier (`plan: free`)
+- **Region:** Oregon (`region: oregon`)
+- **Health Check Path:** `/api/health`
+- **Port:** Configured to bind dynamically to Render's injected `$PORT` (default `10000` declared in `render.yaml`, with fallback to `8000`).
+
+#### Multi-Stage Docker Build Architecture
+The production container employs a hermetic multi-stage build:
+1. **Stage 1 (Frontend Builder — `node:20-alpine`):** Installs frontend dependencies via `npm ci`, runs `npm run build`, and compiles the static production bundle into `frontend/dist`.
+2. **Stage 2 (Runtime Container — `python:3.11-slim`):** Installs production backend dependencies from `backend/requirements.txt`, copies backend application code, and transfers compiled static assets from Stage 1 into `/app/frontend/dist`.
+3. **Single-URL Unified Serving:** FastAPI serves compiled React HTML/CSS/JS assets at the root path (`/`) while routing `/api/*` endpoints from the same origin, eliminating cross-origin CORS overhead in production.
+
+#### Blueprint Environment Configuration
+When connecting the repository via Render Dashboard (**New +** → **Blueprint**), Render reads `render.yaml` and sets up the following environment variables:
+- `PORT`: Pre-configured to `10000` (Render's internal container port).
+- `DATABASE_URL`: Pre-configured to `sqlite:///./krishisetu.db`.
+- `GEMINI_API_KEY`: Marked as `sync: false`. Render prompts for this secret during initial Blueprint setup. If omitted or left empty, the application cleanly activates deterministic multilingual fallback advisory templates across English, Kannada, Hindi, and Marathi.
+- `DATA_GOV_API_KEY`: Marked as `sync: false`. Render prompts for this secret during initial Blueprint setup. If omitted, the application uses the built-in public OGD sample demo key and falls back gracefully to `estimated_benchmark` reference data.
+
+#### SQLite & Ephemeral Filesystem on Render Free Tier
+Free-tier Render instances run on ephemeral containers that reset when spun down due to inactivity (15-minute idle timeout) or on redeployment. On cold boot or container restart, FastAPI's application lifespan automatically invokes `init_db()` and `seed_all()`, idempotently provisioning the SQLite schema, all 10 agronomic crop profiles, and 25 baseline benchmark snapshots. While session-fetched live prices and weather forecasts reset on cold start, the application remains fully functional out of the box with benchmark data immediately available for evaluation.
+
+---
+
+### Alternative: Standalone Docker Run
+To run the production container locally or on other container platforms (GCP Cloud Run, AWS ECS):
 
 ```bash
-# Build the unified container
+# Build the unified production container
 docker build -t krishisetu .
 
 # Run the container (bound to host port 8000)
@@ -250,14 +276,15 @@ docker run -p 8000:8000 \
   krishisetu
 ```
 
-### Render Deployment Blueprint
-The repository includes a validated [`render.yaml`](render.yaml) specification configuring Render as a native Python Web Service (`runtime: python`):
-- **Runtime Environment:** Native Python (`runtime: python`, Python 3.11.9) with Node.js (20.18.0) automatically available in the environment to build the React frontend bundle during deployment. (The multi-stage [Dockerfile](Dockerfile) is provided separately for containerized hosting on Docker Desktop, Cloud Run, or Kubernetes).
+---
+
+### Alternative: Manual Native Python Web Service (Render Dashboard UI)
+If deploying without Blueprints as a manual Native Python service in Render's dashboard:
+- **Runtime:** `Python 3`
 - **Build Command:** `pip install -r backend/requirements.txt && cd frontend && npm install && npm run build && cd ..`
 - **Start Command:** `uvicorn backend.app.main:app --host 0.0.0.0 --port $PORT`
 - **Health Check Path:** `/api/health`
-- **Port:** Dynamically binds to `$PORT` (`10000` on Render)
-- **Database Persistence on Free Tier:** Free-tier Render instances run on ephemeral containers. On container cold boot or restart, FastAPI's application lifespan automatically invokes `init_db()` and `seed_all()`, idempotently provisioning the database with 10 crop profiles and 25 baseline benchmark snapshots. The application remains fully functional out of the box.
+- **Environment Variables:** Set `PYTHON_VERSION=3.11.9`, `NODE_VERSION=20.18.0`, `DATABASE_URL=sqlite:///./krishisetu.db`, `GEMINI_API_KEY`, and `DATA_GOV_API_KEY`.
 
 ---
 
