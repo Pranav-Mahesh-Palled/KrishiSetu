@@ -1,0 +1,2 @@
+# Development and testing dependencies for KrishiSetu (root wrapper)
+-r backend/requirements-dev.txt

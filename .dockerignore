@@ -1,0 +1,36 @@
+# Version control
+.git/
+.gitignore
+
+# Dependencies & Environments
+node_modules/
+frontend/node_modules/
+.venv/
+backend/.venv/
+venv/
+env/
+
+# Environment files
+.env
+.env.local
+.env.*.local
+
+# Python cache & tests
+__pycache__/
+backend/**/__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Local databases
+*.db
+*.sqlite3
+krishisetu.db
+
+# OS metadata
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
