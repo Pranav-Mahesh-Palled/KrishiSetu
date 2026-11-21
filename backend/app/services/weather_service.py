@@ -7,11 +7,12 @@ Provides:
 """
 
 import asyncio
+from email.utils import parsedate_to_datetime
 import json
 import logging
 import time
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, Optional, Union
+from typing import Any, Dict, Optional, Tuple, Union
 import httpx
 from sqlalchemy.orm import Session
 
@@ -22,12 +23,27 @@ logger = logging.getLogger(__name__)
 
 CACHE_TTL_HOURS = 3
 COOLDOWN_SECONDS = 60
+INITIAL_429_BACKOFF_SECONDS = 15.0
+MAX_429_BACKOFF_SECONDS = 300.0
 GEOCODING_URL = "https://geocoding-api.open-meteo.com/v1/search"
 FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
 
 # In-memory concurrency locks and rate-limiting trackers per location scope
 _weather_location_locks: Dict[str, asyncio.Lock] = {}
 _weather_last_attempt: Dict[str, float] = {}
+
+# Provider-wide concurrency lock and 429 backoff tracking
+_open_meteo_provider_lock: Optional[asyncio.Lock] = None
+_provider_429_until: float = 0.0
+_provider_429_backoff: float = INITIAL_429_BACKOFF_SECONDS
+
+
+def _get_provider_lock() -> asyncio.Lock:
+    """Retrieves or creates the provider-level asyncio.Lock for outbound Open-Meteo calls."""
+    global _open_meteo_provider_lock
+    if _open_meteo_provider_lock is None:
+        _open_meteo_provider_lock = asyncio.Lock()
+    return _open_meteo_provider_lock
 
 
 def _get_weather_lock(location_key: str) -> asyncio.Lock:
@@ -37,10 +53,96 @@ def _get_weather_lock(location_key: str) -> asyncio.Lock:
     return _weather_location_locks[location_key]
 
 
+def is_provider_429_active() -> Tuple[bool, int]:
+    """Checks if provider-wide 429 cooldown is currently active.
+
+    Returns:
+        Tuple of (is_active, remaining_seconds).
+    """
+    mono_now = time.monotonic()
+    if mono_now < _provider_429_until:
+        rem = max(1, int(round(_provider_429_until - mono_now)))
+        return True, rem
+    return False, 0
+
+
+def _handle_429_response(resp: httpx.Response) -> float:
+    """Handles Open-Meteo 429 rate limit response, parsing Retry-After and scheduling backoff.
+
+    Supports both numeric delay-seconds and RFC 7231 / RFC 9110 HTTP-date values.
+
+    Returns:
+        Applied cooldown duration in seconds.
+    """
+    global _provider_429_until, _provider_429_backoff
+
+    retry_after_hdr = resp.headers.get("Retry-After")
+    backoff_dur: Optional[float] = None
+    if retry_after_hdr:
+        raw_val = retry_after_hdr.strip()
+        # 1. Attempt numeric delay-seconds
+        try:
+            val = float(raw_val)
+            if val > 0:
+                backoff_dur = min(MAX_429_BACKOFF_SECONDS, max(1.0, val))
+        except (ValueError, TypeError):
+            # 2. Attempt RFC 7231 / RFC 9110 HTTP-date
+            try:
+                dt = parsedate_to_datetime(raw_val)
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                else:
+                    dt = dt.astimezone(timezone.utc)
+                diff = (dt - datetime.now(timezone.utc)).total_seconds()
+                if diff > 0:
+                    backoff_dur = min(MAX_429_BACKOFF_SECONDS, max(1.0, diff))
+            except Exception:
+                backoff_dur = None
+
+    if backoff_dur is None:
+        backoff_dur = _provider_429_backoff
+        _provider_429_backoff = min(MAX_429_BACKOFF_SECONDS, _provider_429_backoff * 2.0)
+    else:
+        _provider_429_backoff = min(MAX_429_BACKOFF_SECONDS, max(INITIAL_429_BACKOFF_SECONDS, backoff_dur * 2.0))
+
+    _provider_429_until = time.monotonic() + backoff_dur
+
+    reason_text = "Rate limit exceeded"
+    try:
+        body = resp.json()
+        if isinstance(body, dict):
+            if body.get("reason"):
+                reason_text = str(body["reason"])[:120]
+            elif body.get("error"):
+                reason_text = str(body["error"])[:120]
+    except Exception:
+        if resp.text:
+            reason_text = resp.text[:120].strip()
+
+    logger.warning(
+        "Open-Meteo HTTP 429 rate limit encountered (reason: '%s'). "
+        "Applying provider-wide cooldown of %d seconds.",
+        reason_text,
+        int(backoff_dur),
+    )
+    return backoff_dur
+
+
+def _reset_429_backoff_on_success() -> None:
+    """Resets provider-level 429 backoff upon receiving successful HTTP 200 from Open-Meteo."""
+    global _provider_429_until, _provider_429_backoff
+    _provider_429_until = 0.0
+    _provider_429_backoff = INITIAL_429_BACKOFF_SECONDS
+
+
 def clear_weather_cooldown_trackers() -> None:
-    """Utility for test suites to reset in-memory attempt timestamps and locks."""
+    """Utility for test suites to reset in-memory attempt timestamps, locks, and 429 backoff."""
+    global _open_meteo_provider_lock, _provider_429_until, _provider_429_backoff
     _weather_last_attempt.clear()
     _weather_location_locks.clear()
+    _open_meteo_provider_lock = None
+    _provider_429_until = 0.0
+    _provider_429_backoff = INITIAL_429_BACKOFF_SECONDS
 
 
 def normalize_utc_datetime(dt: Optional[Union[datetime, str]]) -> Optional[datetime]:
@@ -192,36 +294,81 @@ async def get_weather_forecast(
                 except Exception as e:
                     logger.error(f"Failed to parse cached weather JSON for {location_key}: {e}")
 
-        # If cache miss or stale, fetch live
+        # If cache miss or stale, fetch live safely with serialization and 429 protection
         if not raw_data:
-            try:
-                async with httpx.AsyncClient(timeout=6.0) as client:
-                    resp = await client.get(FORECAST_URL, params=params)
-                    if resp.status_code == 200:
-                        raw_data = resp.json()
-                        fetched_at_utc = now
-                        weather_source = "open_meteo"
-                        retrieval_status = "live_response"
-                        freshness_status = "fresh"
-
-                        if cached_record:
-                            cached_record.payload_json = json.dumps(raw_data)
-                            cached_record.fetched_at = now
-                        else:
-                            new_cache = WeatherCache(
-                                location_key=location_key,
-                                payload_json=json.dumps(raw_data),
-                                fetched_at=now,
-                            )
-                            db.add(new_cache)
-                        db.commit()
+            is_429, rem_429 = is_provider_429_active()
+            if is_429:
+                logger.info(
+                    "Skipping Open-Meteo live request for %s: provider-wide 429 cooldown active (%ds remaining).",
+                    location_key,
+                    rem_429,
+                )
+            else:
+                provider_lock = _get_provider_lock()
+                async with provider_lock:
+                    # Re-check 429 status inside lock
+                    is_429, rem_429 = is_provider_429_active()
+                    if is_429:
+                        logger.info(
+                            "Skipping Open-Meteo live request for %s after acquiring lock: 429 cooldown active (%ds remaining).",
+                            location_key,
+                            rem_429,
+                        )
                     else:
-                        logger.warning(f"Open-Meteo API returned status {resp.status_code}")
-            except Exception as exc:
-                logger.warning(f"Open-Meteo forecast fetch failed for ({latitude}, {longitude}): {exc}")
+                        # Re-query cache inside provider lock for request coalescing
+                        now_locked = datetime.now(timezone.utc)
+                        db.expire_all()
+                        cached_record = db.query(WeatherCache).filter(WeatherCache.location_key == location_key).first()
+                        if cached_record:
+                            norm_f = normalize_utc_datetime(cached_record.fetched_at)
+                            if norm_f and (now_locked - norm_f).total_seconds() < CACHE_TTL_HOURS * 3600:
+                                try:
+                                    raw_data = json.loads(cached_record.payload_json)
+                                    fetched_at_utc = norm_f
+                                    weather_source = "open_meteo"
+                                    retrieval_status = "cache_hit"
+                                    freshness_status = "cached"
+                                except Exception:
+                                    pass
+
+                        if not raw_data:
+                            try:
+                                async with httpx.AsyncClient(timeout=6.0) as client:
+                                    resp = await client.get(FORECAST_URL, params=params)
+                                    if resp.status_code == 200:
+                                        _reset_429_backoff_on_success()
+                                        parsed = resp.json()
+                                        if isinstance(parsed, dict) and ("daily" in parsed or "hourly" in parsed):
+                                            raw_data = parsed
+                                            fetched_at_utc = now_locked
+                                            weather_source = "open_meteo"
+                                            retrieval_status = "live_response"
+                                            freshness_status = "fresh"
+
+                                            if cached_record:
+                                                cached_record.payload_json = json.dumps(raw_data)
+                                                cached_record.fetched_at = now_locked
+                                            else:
+                                                new_cache = WeatherCache(
+                                                    location_key=location_key,
+                                                    payload_json=json.dumps(raw_data),
+                                                    fetched_at=now_locked,
+                                                )
+                                                db.add(new_cache)
+                                            db.commit()
+                                        else:
+                                            logger.warning("Open-Meteo API returned invalid JSON payload for %s", location_key)
+                                    elif resp.status_code == 429:
+                                        _handle_429_response(resp)
+                                    else:
+                                        logger.warning("Open-Meteo API returned status %s for %s", resp.status_code, location_key)
+                            except (httpx.TimeoutException, httpx.NetworkError) as exc:
+                                logger.warning("Open-Meteo forecast fetch network/timeout issue for %s: %s", location_key, exc)
+                            except Exception as exc:
+                                logger.warning("Open-Meteo forecast fetch failed for %s: %s", location_key, exc)
 
     else:
-        # Manual refresh requested: evaluate 60s cooldown per location_key
+        # Manual refresh requested: evaluate cooldowns
         mono_now = time.monotonic()
         mono_attempt = _weather_last_attempt.get(location_key)
         mono_rem = (
@@ -238,108 +385,127 @@ async def get_weather_forecast(
                 if 0 <= db_elapsed < COOLDOWN_SECONDS:
                     db_rem = max(1, int(COOLDOWN_SECONDS - db_elapsed))
 
-        cooldown_remaining_seconds = max(mono_rem, db_rem)
+        is_429, rem_429 = is_provider_429_active()
+        cooldown_remaining_seconds = max(mono_rem, db_rem, rem_429)
 
-        if cooldown_remaining_seconds > 0:
-            # Under cooldown: reject repeated upstream request, retain existing cache
+        if is_429:
+            refresh_status = "cooldown"
+            logger.info(
+                "Manual refresh throttled for %s: provider-wide 429 cooldown active (%ds remaining).",
+                location_key,
+                rem_429,
+            )
+        elif cooldown_remaining_seconds > 0:
+            # Under location cooldown: reject repeated upstream request, retain existing cache
             refresh_status = "cooldown"
         else:
-            # Outside cooldown: acquire concurrency lock to prevent duplicate simultaneous upstream calls
-            lock = _get_weather_lock(location_key)
-            async with lock:
-                mono_now = time.monotonic()
-                mono_attempt = _weather_last_attempt.get(location_key)
-                mono_rem = (
-                    max(1, int(COOLDOWN_SECONDS - (mono_now - mono_attempt)))
-                    if mono_attempt is not None and (mono_now - mono_attempt) < COOLDOWN_SECONDS
-                    else 0
-                )
-
-                now_locked = datetime.now(timezone.utc)
-                # Re-query cache and re-check inside lock for request coalescing
-                cached_record = db.query(WeatherCache).filter(WeatherCache.location_key == location_key).first()
-                db_rem = 0
-                norm_f_locked = None
-                if cached_record and cached_record.fetched_at:
-                    norm_f_locked = normalize_utc_datetime(cached_record.fetched_at)
-                    if norm_f_locked:
-                        db_elapsed = (now_locked - norm_f_locked).total_seconds()
-                        if 0 <= db_elapsed < COOLDOWN_SECONDS:
-                            db_rem = max(1, int(COOLDOWN_SECONDS - db_elapsed))
-
-                cooldown_rem_locked = max(mono_rem, db_rem)
-
-                mono_elapsed = (mono_now - mono_attempt) if mono_attempt is not None else 999.0
-                db_elapsed_val = (now_locked - norm_f_locked).total_seconds() if norm_f_locked else 999.0
-
-                if (mono_elapsed < 5.0 or db_elapsed_val < 5.0) and cached_record:
-                    # Concurrently coalesced request: use just-refreshed cache
-                    elapsed_post = max(0.0, time.monotonic() - mono_attempt) if mono_attempt is not None else 0.0
-                    cooldown_remaining_seconds = max(1, int(COOLDOWN_SECONDS - elapsed_post)) if elapsed_post < COOLDOWN_SECONDS else 0
-                    try:
-                        raw_data = json.loads(cached_record.payload_json)
-                        fetched_at_utc = normalize_utc_datetime(cached_record.fetched_at)
-                        weather_source = "open_meteo"
-                        retrieval_status = "live_response"
-                        freshness_status = "fresh"
-                        refresh_status = "refreshed"
-                    except Exception:
-                        pass
-                elif cooldown_rem_locked > 0:
+            # Outside cooldown: serialize through provider lock to prevent duplicate simultaneous upstream calls
+            provider_lock = _get_provider_lock()
+            async with provider_lock:
+                # Re-check 429 status inside lock
+                is_429, rem_429 = is_provider_429_active()
+                if is_429:
                     refresh_status = "cooldown"
-                    cooldown_remaining_seconds = cooldown_rem_locked
+                    cooldown_remaining_seconds = rem_429
                 else:
-                    # Execute upstream request
-                    _weather_last_attempt[location_key] = time.monotonic()
-                    try:
-                        async with httpx.AsyncClient(timeout=6.0) as client:
-                            resp = await client.get(FORECAST_URL, params=params)
-                            elapsed_post = max(0.0, time.monotonic() - _weather_last_attempt[location_key])
-                            rem_cooldown = max(1, int(COOLDOWN_SECONDS - elapsed_post)) if elapsed_post < COOLDOWN_SECONDS else 0
+                    mono_now = time.monotonic()
+                    mono_attempt = _weather_last_attempt.get(location_key)
+                    mono_rem = (
+                        max(1, int(COOLDOWN_SECONDS - (mono_now - mono_attempt)))
+                        if mono_attempt is not None and (mono_now - mono_attempt) < COOLDOWN_SECONDS
+                        else 0
+                    )
 
-                            if resp.status_code == 200:
-                                parsed = resp.json()
-                                if not isinstance(parsed, dict) or ("daily" not in parsed and "hourly" not in parsed):
-                                    refresh_status = "invalid_response"
+                    now_locked = datetime.now(timezone.utc)
+                    db.expire_all()
+                    cached_record = db.query(WeatherCache).filter(WeatherCache.location_key == location_key).first()
+                    db_rem = 0
+                    norm_f_locked = None
+                    if cached_record and cached_record.fetched_at:
+                        norm_f_locked = normalize_utc_datetime(cached_record.fetched_at)
+                        if norm_f_locked:
+                            db_elapsed = (now_locked - norm_f_locked).total_seconds()
+                            if 0 <= db_elapsed < COOLDOWN_SECONDS:
+                                db_rem = max(1, int(COOLDOWN_SECONDS - db_elapsed))
+
+                    cooldown_rem_locked = max(mono_rem, db_rem)
+
+                    mono_elapsed = (mono_now - mono_attempt) if mono_attempt is not None else 999.0
+                    db_elapsed_val = (now_locked - norm_f_locked).total_seconds() if norm_f_locked else 999.0
+
+                    if (mono_elapsed < 5.0 or db_elapsed_val < 5.0) and cached_record:
+                        # Concurrently coalesced request: use just-refreshed cache
+                        elapsed_post = max(0.0, time.monotonic() - mono_attempt) if mono_attempt is not None else 0.0
+                        cooldown_remaining_seconds = max(1, int(COOLDOWN_SECONDS - elapsed_post)) if elapsed_post < COOLDOWN_SECONDS else 0
+                        try:
+                            raw_data = json.loads(cached_record.payload_json)
+                            fetched_at_utc = normalize_utc_datetime(cached_record.fetched_at)
+                            weather_source = "open_meteo"
+                            retrieval_status = "live_response"
+                            freshness_status = "fresh"
+                            refresh_status = "refreshed"
+                        except Exception:
+                            pass
+                    elif cooldown_rem_locked > 0:
+                        refresh_status = "cooldown"
+                        cooldown_remaining_seconds = cooldown_rem_locked
+                    else:
+                        # Execute upstream request
+                        _weather_last_attempt[location_key] = time.monotonic()
+                        try:
+                            async with httpx.AsyncClient(timeout=6.0) as client:
+                                resp = await client.get(FORECAST_URL, params=params)
+                                elapsed_post = max(0.0, time.monotonic() - _weather_last_attempt[location_key])
+                                rem_cooldown = max(1, int(COOLDOWN_SECONDS - elapsed_post)) if elapsed_post < COOLDOWN_SECONDS else 0
+
+                                if resp.status_code == 200:
+                                    _reset_429_backoff_on_success()
+                                    parsed = resp.json()
+                                    if not isinstance(parsed, dict) or ("daily" not in parsed and "hourly" not in parsed):
+                                        refresh_status = "invalid_response"
+                                        cooldown_remaining_seconds = rem_cooldown
+                                    else:
+                                        raw_data = parsed
+                                        fetched_at_utc = now_locked
+                                        weather_source = "open_meteo"
+                                        retrieval_status = "live_response"
+                                        freshness_status = "fresh"
+                                        refresh_status = "refreshed"
+                                        cooldown_remaining_seconds = rem_cooldown
+
+                                        if cached_record:
+                                            cached_record.payload_json = json.dumps(raw_data)
+                                            cached_record.fetched_at = now_locked
+                                        else:
+                                            new_cache = WeatherCache(
+                                                location_key=location_key,
+                                                payload_json=json.dumps(raw_data),
+                                                fetched_at=now_locked,
+                                            )
+                                            db.add(new_cache)
+                                        db.commit()
+                                elif resp.status_code == 429:
+                                    dur_429 = _handle_429_response(resp)
+                                    refresh_status = "upstream_unavailable"
+                                    cooldown_remaining_seconds = int(dur_429)
+                                elif resp.status_code in (500, 502, 503, 504):
+                                    refresh_status = "upstream_unavailable"
                                     cooldown_remaining_seconds = rem_cooldown
                                 else:
-                                    raw_data = parsed
-                                    fetched_at_utc = now_locked
-                                    weather_source = "open_meteo"
-                                    retrieval_status = "live_response"
-                                    freshness_status = "fresh"
-                                    refresh_status = "refreshed"
+                                    refresh_status = "invalid_response"
                                     cooldown_remaining_seconds = rem_cooldown
-
-                                    if cached_record:
-                                        cached_record.payload_json = json.dumps(raw_data)
-                                        cached_record.fetched_at = now_locked
-                                    else:
-                                        new_cache = WeatherCache(
-                                            location_key=location_key,
-                                            payload_json=json.dumps(raw_data),
-                                            fetched_at=now_locked,
-                                        )
-                                        db.add(new_cache)
-                                    db.commit()
-                            elif resp.status_code in (500, 502, 503, 504):
-                                refresh_status = "upstream_unavailable"
-                                cooldown_remaining_seconds = rem_cooldown
-                            else:
-                                refresh_status = "invalid_response"
-                                cooldown_remaining_seconds = rem_cooldown
-                    except (httpx.TimeoutException, httpx.NetworkError):
-                        elapsed_post = max(0.0, time.monotonic() - _weather_last_attempt[location_key])
-                        refresh_status = "upstream_unavailable"
-                        cooldown_remaining_seconds = max(1, int(COOLDOWN_SECONDS - elapsed_post)) if elapsed_post < COOLDOWN_SECONDS else 0
-                    except json.JSONDecodeError:
-                        elapsed_post = max(0.0, time.monotonic() - _weather_last_attempt[location_key])
-                        refresh_status = "invalid_response"
-                        cooldown_remaining_seconds = max(1, int(COOLDOWN_SECONDS - elapsed_post)) if elapsed_post < COOLDOWN_SECONDS else 0
-                    except Exception as exc:
-                        elapsed_post = max(0.0, time.monotonic() - _weather_last_attempt[location_key])
-                        refresh_status = "upstream_unavailable"
-                        cooldown_remaining_seconds = max(1, int(COOLDOWN_SECONDS - elapsed_post)) if elapsed_post < COOLDOWN_SECONDS else 0
+                        except (httpx.TimeoutException, httpx.NetworkError):
+                            elapsed_post = max(0.0, time.monotonic() - _weather_last_attempt[location_key])
+                            refresh_status = "upstream_unavailable"
+                            cooldown_remaining_seconds = max(1, int(COOLDOWN_SECONDS - elapsed_post)) if elapsed_post < COOLDOWN_SECONDS else 0
+                        except json.JSONDecodeError:
+                            elapsed_post = max(0.0, time.monotonic() - _weather_last_attempt[location_key])
+                            refresh_status = "invalid_response"
+                            cooldown_remaining_seconds = max(1, int(COOLDOWN_SECONDS - elapsed_post)) if elapsed_post < COOLDOWN_SECONDS else 0
+                        except Exception as exc:
+                            elapsed_post = max(0.0, time.monotonic() - _weather_last_attempt[location_key])
+                            refresh_status = "upstream_unavailable"
+                            cooldown_remaining_seconds = max(1, int(COOLDOWN_SECONDS - elapsed_post)) if elapsed_post < COOLDOWN_SECONDS else 0
 
     # 3. Fallback resolution if live data was not obtained
     if not raw_data:

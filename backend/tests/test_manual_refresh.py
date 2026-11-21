@@ -35,6 +35,7 @@ API Integration:
 
 import asyncio
 from datetime import datetime, timedelta, timezone
+from email.utils import format_datetime
 import json
 import time
 from unittest.mock import AsyncMock, patch
@@ -54,8 +55,10 @@ from backend.app.services.mandi_service import (
     get_mandi_arbitrage_analysis,
 )
 from backend.app.services.weather_service import (
+    _handle_429_response,
     clear_weather_cooldown_trackers,
     get_weather_forecast,
+    is_provider_429_active,
     normalize_utc_datetime,
 )
 
@@ -1280,4 +1283,357 @@ async def test_cooldown_clock_consistency_under_system_clock_jump(canned_weather
         assert 25 <= weather_data["cooldown_remaining_seconds"] <= 35
     finally:
         db.close()
+
+
+# ==============================================================================
+# Part 5: Open-Meteo Concurrency & 429 Backoff Tests
+# ==============================================================================
+
+@pytest.mark.anyio
+async def test_weather_concurrent_same_coordinates_coalesce_single_upstream(canned_weather_forecast):
+    """33. Concurrent requests for the same coordinates make only 1 upstream call; 2nd request uses the newly written cache."""
+    db1 = SessionLocal()
+    db2 = SessionLocal()
+    try:
+        lat, lon = 15.85, 74.50
+        upstream_calls = 0
+
+        async def mock_get(*args, **kwargs):
+            nonlocal upstream_calls
+            upstream_calls += 1
+            await asyncio.sleep(0.05)  # simulate network latency
+            resp = AsyncMock()
+            resp.status_code = 200
+            resp.json = lambda: canned_weather_forecast
+            return resp
+
+        with patch("backend.app.services.weather_service.httpx.AsyncClient.get", side_effect=mock_get):
+            res1, res2 = await asyncio.gather(
+                get_weather_forecast(lat, lon, "medium", db1, force_refresh=False),
+                get_weather_forecast(lat, lon, "medium", db2, force_refresh=False),
+            )
+
+        assert upstream_calls == 1
+        assert res1["freshness_status"] in ("fresh", "cached")
+        assert res2["freshness_status"] in ("fresh", "cached")
+        assert res1["data_source"] == "open_meteo"
+        assert res2["data_source"] == "open_meteo"
+    finally:
+        db1.close()
+        db2.close()
+
+
+@pytest.mark.anyio
+async def test_weather_concurrent_different_coordinates_serialized(canned_weather_forecast):
+    """34. Concurrent requests for different coordinates are serialized through provider lock."""
+    db1 = SessionLocal()
+    db2 = SessionLocal()
+    try:
+        active_calls = 0
+        max_active_calls = 0
+
+        async def mock_get(*args, **kwargs):
+            nonlocal active_calls, max_active_calls
+            active_calls += 1
+            if active_calls > max_active_calls:
+                max_active_calls = active_calls
+            await asyncio.sleep(0.05)
+            active_calls -= 1
+            resp = AsyncMock()
+            resp.status_code = 200
+            resp.json = lambda: canned_weather_forecast
+            return resp
+
+        with patch("backend.app.services.weather_service.httpx.AsyncClient.get", side_effect=mock_get):
+            res1, res2 = await asyncio.gather(
+                get_weather_forecast(15.85, 74.50, "medium", db1, force_refresh=False),
+                get_weather_forecast(19.99, 73.79, "medium", db2, force_refresh=False),
+            )
+
+        # Provider lock strictly prevents concurrent outbound calls!
+        assert max_active_calls == 1
+        assert res1["freshness_status"] == "fresh"
+        assert res2["freshness_status"] == "fresh"
+    finally:
+        db1.close()
+        db2.close()
+
+
+@pytest.mark.anyio
+async def test_weather_429_activates_provider_cooldown_across_all_locations():
+    """35. HTTP 429 response activates provider-wide backoff across all locations."""
+    db = SessionLocal()
+    try:
+        lat1, lon1 = 15.85, 74.50
+        lat2, lon2 = 18.52, 73.86
+        calls = 0
+
+        resp_429 = AsyncMock()
+        resp_429.status_code = 429
+        resp_429.headers = {}
+        resp_429.json = lambda: {"reason": "Hourly API request limit exceeded"}
+        resp_429.text = "Hourly API request limit exceeded"
+
+        async def mock_get(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            return resp_429
+
+        with patch("backend.app.services.weather_service.httpx.AsyncClient.get", side_effect=mock_get):
+            # First request to location 1 encounters 429
+            data1 = await get_weather_forecast(lat1, lon1, "medium", db, force_refresh=False)
+            assert data1["retrieval_status"] == "synthetic_fallback"
+            assert calls == 1
+
+            # Second request to completely different location 2 must NOT hit upstream
+            data2 = await get_weather_forecast(lat2, lon2, "medium", db, force_refresh=False)
+            assert data2["retrieval_status"] == "synthetic_fallback"
+            assert calls == 1  # Still 1! Provider-wide backoff prevented upstream call!
+
+            # Manual refresh to location 2 must also be throttled without calling upstream
+            data3 = await get_weather_forecast(lat2, lon2, "medium", db, force_refresh=True)
+            assert data3["refresh_status"] == "cooldown"
+            assert data3["cooldown_remaining_seconds"] > 0
+            assert calls == 1  # Still 1!
+    finally:
+        db.close()
+
+
+@pytest.mark.anyio
+async def test_weather_429_respects_retry_after_header():
+    """36. Open-Meteo Retry-After header is parsed and respected."""
+    db = SessionLocal()
+    try:
+        lat, lon = 15.85, 74.50
+        resp_429 = AsyncMock()
+        resp_429.status_code = 429
+        resp_429.headers = {"Retry-After": "45"}
+        resp_429.json = lambda: {"reason": "Too Many Requests"}
+        resp_429.text = "Too Many Requests"
+
+        with patch("backend.app.services.weather_service.httpx.AsyncClient.get", AsyncMock(return_value=resp_429)):
+            data = await get_weather_forecast(lat, lon, "medium", db, force_refresh=True)
+
+        assert data["refresh_status"] == "upstream_unavailable"
+        assert 40 <= data["cooldown_remaining_seconds"] <= 45
+
+        is_active, rem = is_provider_429_active()
+        assert is_active is True
+        assert 40 <= rem <= 45
+    finally:
+        db.close()
+
+
+@pytest.mark.anyio
+async def test_weather_429_http_date_valid_future():
+    """36a. Valid future HTTP-date in Retry-After header sets expected cooldown."""
+    clear_weather_cooldown_trackers()
+    future_time = datetime.now(timezone.utc) + timedelta(seconds=50)
+    http_date = format_datetime(future_time, usegmt=True)
+
+    resp_429 = AsyncMock()
+    resp_429.status_code = 429
+    resp_429.headers = {"Retry-After": http_date}
+    resp_429.json = lambda: {"reason": "Rate limited"}
+
+    dur = _handle_429_response(resp_429)
+    assert 45 <= dur <= 52
+
+    is_active, rem = is_provider_429_active()
+    assert is_active is True
+    assert 45 <= rem <= 52
+
+
+@pytest.mark.anyio
+async def test_weather_429_http_date_expired_falls_back_to_exponential():
+    """36b. Expired HTTP-date in Retry-After falls back to internal exponential backoff."""
+    clear_weather_cooldown_trackers()
+    from backend.app.services.weather_service import INITIAL_429_BACKOFF_SECONDS
+    past_time = datetime.now(timezone.utc) - timedelta(seconds=15)
+    http_date = format_datetime(past_time, usegmt=True)
+
+    resp_429 = AsyncMock()
+    resp_429.status_code = 429
+    resp_429.headers = {"Retry-After": http_date}
+    resp_429.json = lambda: {"reason": "Rate limited"}
+
+    dur = _handle_429_response(resp_429)
+    assert dur == INITIAL_429_BACKOFF_SECONDS
+
+
+@pytest.mark.anyio
+async def test_weather_429_http_date_malformed_falls_back_to_exponential():
+    """36c. Malformed date string in Retry-After falls back to internal exponential backoff."""
+    clear_weather_cooldown_trackers()
+    from backend.app.services.weather_service import INITIAL_429_BACKOFF_SECONDS
+
+    resp_429 = AsyncMock()
+    resp_429.status_code = 429
+    resp_429.headers = {"Retry-After": "not-a-valid-rfc-http-date-or-number"}
+    resp_429.json = lambda: {"reason": "Rate limited"}
+
+    dur = _handle_429_response(resp_429)
+    assert dur == INITIAL_429_BACKOFF_SECONDS
+
+
+@pytest.mark.anyio
+async def test_weather_429_http_date_excessive_clamped_to_max():
+    """36d. Excessive future HTTP-date in Retry-After is clamped to MAX_429_BACKOFF_SECONDS (300s)."""
+    clear_weather_cooldown_trackers()
+    from backend.app.services.weather_service import MAX_429_BACKOFF_SECONDS
+    far_future = datetime.now(timezone.utc) + timedelta(days=2)
+    http_date = format_datetime(far_future, usegmt=True)
+
+    resp_429 = AsyncMock()
+    resp_429.status_code = 429
+    resp_429.headers = {"Retry-After": http_date}
+    resp_429.json = lambda: {"reason": "Rate limited"}
+
+    dur = _handle_429_response(resp_429)
+    assert dur == MAX_429_BACKOFF_SECONDS
+
+
+@pytest.mark.anyio
+async def test_weather_429_exponential_backoff_doubling():
+    """37. Consecutive 429s without Retry-After double backoff duration up to cap."""
+    db = SessionLocal()
+    try:
+        from backend.app.services.weather_service import (
+            _handle_429_response,
+            clear_weather_cooldown_trackers,
+            INITIAL_429_BACKOFF_SECONDS,
+            MAX_429_BACKOFF_SECONDS,
+        )
+        clear_weather_cooldown_trackers()
+
+        resp_429 = AsyncMock()
+        resp_429.status_code = 429
+        resp_429.headers = {}
+        resp_429.json = lambda: {"reason": "Rate limited"}
+
+        d1 = _handle_429_response(resp_429)
+        assert d1 == INITIAL_429_BACKOFF_SECONDS  # 15s
+
+        d2 = _handle_429_response(resp_429)
+        assert d2 == 30.0  # 15 * 2
+
+        d3 = _handle_429_response(resp_429)
+        assert d3 == 60.0  # 30 * 2
+
+        d4 = _handle_429_response(resp_429)
+        assert d4 == 120.0
+
+        d5 = _handle_429_response(resp_429)
+        assert d5 == 240.0
+
+        d6 = _handle_429_response(resp_429)
+        assert d6 == MAX_429_BACKOFF_SECONDS  # Capped at 300.0
+    finally:
+        db.close()
+
+
+@pytest.mark.anyio
+async def test_weather_http_200_resets_429_backoff(canned_weather_forecast):
+    """38. Successful HTTP 200 resets provider 429 backoff."""
+    db = SessionLocal()
+    try:
+        from backend.app.services.weather_service import (
+            _handle_429_response,
+            _reset_429_backoff_on_success,
+        )
+
+        resp_429 = AsyncMock()
+        resp_429.status_code = 429
+        resp_429.headers = {}
+        resp_429.json = lambda: {"reason": "Rate limited"}
+
+        _handle_429_response(resp_429)
+        assert is_provider_429_active()[0] is True
+
+        _reset_429_backoff_on_success()
+
+        is_active, rem = is_provider_429_active()
+        assert is_active is False
+        assert rem == 0
+    finally:
+        db.close()
+
+
+@pytest.mark.anyio
+async def test_weather_429_preserves_valid_cache_and_never_writes_synthetic(canned_weather_forecast):
+    """39. 429 preserves valid existing cache; synthetic fallback is never written to SQLite."""
+    db = SessionLocal()
+    try:
+        lat, lon = 15.85, 74.50
+        loc_key = f"{round(lat, 2):.2f}_{round(lon, 2):.2f}"
+        initial_time = datetime.now(timezone.utc) - timedelta(minutes=20)
+
+        # Pre-seed cache
+        cache_entry = WeatherCache(
+            location_key=loc_key,
+            payload_json=json.dumps(canned_weather_forecast),
+            fetched_at=initial_time,
+        )
+        db.add(cache_entry)
+        db.commit()
+
+        # Simulate 429 on forced refresh
+        resp_429 = AsyncMock()
+        resp_429.status_code = 429
+        resp_429.headers = {"Retry-After": "30"}
+        resp_429.json = lambda: {"reason": "Too many calls"}
+
+        with patch("backend.app.services.weather_service.httpx.AsyncClient.get", AsyncMock(return_value=resp_429)):
+            data = await get_weather_forecast(lat, lon, "medium", db, force_refresh=True)
+
+        # Existing cache must be preserved
+        assert data["refresh_status"] == "upstream_unavailable"
+        assert data["retrieval_status"] == "cache_hit"
+        assert data["freshness_status"] == "cached"
+        assert data["data_source"] == "open_meteo"
+
+        # Verify database record was NOT overwritten or corrupted
+        db.expire_all()
+        persisted = db.query(WeatherCache).filter(WeatherCache.location_key == loc_key).first()
+        assert persisted is not None
+        assert normalize_utc_datetime(persisted.fetched_at) == initial_time
+        assert json.loads(persisted.payload_json) == canned_weather_forecast
+
+        # Also test with a fresh location that has NO cache: synthetic fallback is generated but NOT persisted in SQLite
+        new_loc_key = "99.99_99.99"
+        # Ensure provider 429 is active so no outbound request is made
+        clear_weather_cooldown_trackers()
+        _handle_429_response(resp_429)
+
+        data_nocache = await get_weather_forecast(99.99, 99.99, "medium", db, force_refresh=False)
+        assert data_nocache["data_source"] == "synthetic_baseline"
+        assert data_nocache["freshness_status"] == "estimated"
+        assert data_nocache["retrieval_status"] == "synthetic_fallback"
+        assert data_nocache["fetched_at"] is None
+
+        # Verify nothing was added to SQLite for new_loc_key
+        db.expire_all()
+        empty_check = db.query(WeatherCache).filter(WeatherCache.location_key == new_loc_key).first()
+        assert empty_check is None
+    finally:
+        db.close()
+
+
+@pytest.mark.anyio
+async def test_weather_clear_trackers_resets_provider_state():
+    """40. clear_weather_cooldown_trackers resets provider lock and backoff counters."""
+    from backend.app.services.weather_service import _handle_429_response
+
+    resp = AsyncMock()
+    resp.status_code = 429
+    resp.headers = {}
+    resp.json = lambda: {"reason": "Limit reached"}
+
+    _handle_429_response(resp)
+    assert is_provider_429_active()[0] is True
+
+    clear_weather_cooldown_trackers()
+    is_active, rem = is_provider_429_active()
+    assert is_active is False
+    assert rem == 0
 
