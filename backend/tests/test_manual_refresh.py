@@ -55,11 +55,15 @@ from backend.app.services.mandi_service import (
     get_mandi_arbitrage_analysis,
 )
 from backend.app.services.weather_service import (
+    _classify_429_reason,
     _handle_429_response,
     clear_weather_cooldown_trackers,
     get_weather_forecast,
     is_provider_429_active,
+    is_provider_daily_quota_active,
     normalize_utc_datetime,
+    DAILY_429_FALLBACK_COOLDOWN_SECONDS,
+    MAX_DAILY_429_COOLDOWN_SECONDS,
 )
 
 client = TestClient(app)
@@ -1636,4 +1640,241 @@ async def test_weather_clear_trackers_resets_provider_state():
     is_active, rem = is_provider_429_active()
     assert is_active is False
     assert rem == 0
+
+
+# ==============================================================================
+# Part 6: Daily Quota 429 Reason-Aware Tests
+# ==============================================================================
+
+@pytest.mark.anyio
+async def test_weather_429_classify_reasons():
+    """41. _classify_429_reason distinguishes daily, hourly, minutely/concurrency, and unclassified."""
+    assert _classify_429_reason("Daily API request limit exceeded. Please try again tomorrow.") == "daily_quota_exceeded"
+    assert _classify_429_reason("Daily limit reached") == "daily_quota_exceeded"
+    assert _classify_429_reason("Hourly API request limit exceeded") == "hourly_quota_exceeded"
+    assert _classify_429_reason("Minutely API request limit exceeded") == "minute_or_concurrency_limit"
+    assert _classify_429_reason("Too many concurrent requests") == "minute_or_concurrency_limit"
+    assert _classify_429_reason("Rate limit exceeded") == "unclassified_rate_limit"
+    assert _classify_429_reason("") == "unclassified_rate_limit"
+
+
+@pytest.mark.anyio
+async def test_weather_429_daily_quota_without_retry_after_activates_24h_fallback():
+    """42. Daily quota reason without Retry-After activates 24-hour (86400s) fallback cooldown."""
+    clear_weather_cooldown_trackers()
+
+    resp_429 = AsyncMock()
+    resp_429.status_code = 429
+    resp_429.headers = {}
+    resp_429.json = lambda: {"reason": "Daily API request limit exceeded. Please try again tomorrow."}
+    resp_429.text = "Daily API request limit exceeded. Please try again tomorrow."
+
+    dur = _handle_429_response(resp_429)
+    assert dur == DAILY_429_FALLBACK_COOLDOWN_SECONDS
+
+    is_daily, daily_rem = is_provider_daily_quota_active()
+    assert is_daily is True
+    assert 86390 <= daily_rem <= 86400
+
+    is_active, rem = is_provider_429_active()
+    assert is_active is True
+    assert 86390 <= rem <= 86400
+
+
+@pytest.mark.anyio
+async def test_weather_429_daily_quota_respects_valid_retry_after():
+    """43. Daily quota respects a valid Retry-After duration without being shortened by the 300s transient cap."""
+    clear_weather_cooldown_trackers()
+
+    # Suppose Retry-After gives 10 hours (36000s) until UTC midnight reset
+    resp_429 = AsyncMock()
+    resp_429.status_code = 429
+    resp_429.headers = {"Retry-After": "36000"}
+    resp_429.json = lambda: {"reason": "Daily API request limit exceeded"}
+    resp_429.text = "Daily API request limit exceeded"
+
+    dur = _handle_429_response(resp_429)
+    assert dur == 36000.0
+
+    is_daily, rem = is_provider_daily_quota_active()
+    assert is_daily is True
+    assert 35990 <= rem <= 36000
+
+
+@pytest.mark.anyio
+async def test_weather_429_daily_quota_respects_http_date_retry_after():
+    """43b. Daily quota respects an RFC HTTP-date in Retry-After without being shortened by 300s cap."""
+    clear_weather_cooldown_trackers()
+
+    target_time = datetime.now(timezone.utc) + timedelta(hours=12)
+    http_date = format_datetime(target_time, usegmt=True)
+
+    resp_429 = AsyncMock()
+    resp_429.status_code = 429
+    resp_429.headers = {"Retry-After": http_date}
+    resp_429.json = lambda: {"reason": "Daily API request limit exceeded. Please try again tomorrow."}
+    resp_429.text = "Daily API request limit exceeded. Please try again tomorrow."
+
+    dur = _handle_429_response(resp_429)
+    # 12 hours = 43200 seconds; must not be clamped to the 300s transient cap
+    assert 43190 <= dur <= 43210
+
+    is_daily, rem = is_provider_daily_quota_active()
+    assert is_daily is True
+    assert 43190 <= rem <= 43210
+
+
+@pytest.mark.anyio
+async def test_weather_429_daily_quota_applies_across_all_locations():
+    """44. Daily quota cooldown prevents upstream calls across all coordinates."""
+    db = SessionLocal()
+    try:
+        clear_weather_cooldown_trackers()
+        calls = 0
+
+        resp_daily_429 = AsyncMock()
+        resp_daily_429.status_code = 429
+        resp_daily_429.headers = {}
+        resp_daily_429.json = lambda: {"reason": "Daily API request limit exceeded. Please try again tomorrow."}
+        resp_daily_429.text = "Daily API request limit exceeded."
+
+        async def counting_get(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            return resp_daily_429
+
+        with patch("backend.app.services.weather_service.httpx.AsyncClient.get", side_effect=counting_get):
+            # Location 1 (Belagavi) triggers daily quota
+            res1 = await get_weather_forecast(15.85, 74.50, "medium", db, force_refresh=False)
+            assert res1["retrieval_status"] == "synthetic_fallback"
+            assert calls == 1
+
+            # Location 2 (Nashik) must NOT call upstream
+            res2 = await get_weather_forecast(19.99, 73.79, "medium", db, force_refresh=False)
+            assert res2["retrieval_status"] == "synthetic_fallback"
+            assert calls == 1
+
+            # Location 3 (Pune) with forced refresh must report cooldown without calling upstream
+            res3 = await get_weather_forecast(18.52, 73.86, "medium", db, force_refresh=True)
+            assert res3["refresh_status"] == "cooldown"
+            assert res3["cooldown_remaining_seconds"] > 80000
+            assert calls == 1
+    finally:
+        db.close()
+
+
+@pytest.mark.anyio
+async def test_weather_429_normal_analysis_and_forced_refresh_respect_daily_cooldown():
+    """45. Both normal analysis and forced refresh respect active daily quota cooldown."""
+    db = SessionLocal()
+    try:
+        clear_weather_cooldown_trackers()
+
+        # Simulate active daily quota
+        resp_daily = AsyncMock()
+        resp_daily.status_code = 429
+        resp_daily.headers = {}
+        resp_daily.json = lambda: {"reason": "Daily API request limit exceeded"}
+        _handle_429_response(resp_daily)
+
+        call_count = 0
+        async def mock_get(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            return AsyncMock(status_code=200)
+
+        with patch("backend.app.services.weather_service.httpx.AsyncClient.get", side_effect=mock_get):
+            # Normal analysis
+            normal_res = await get_weather_forecast(15.85, 74.50, "medium", db, force_refresh=False)
+            assert normal_res["refresh_status"] == "not_requested"
+            assert normal_res["cooldown_remaining_seconds"] == 0
+            assert normal_res["retrieval_status"] == "synthetic_fallback"
+
+            # Forced refresh
+            refresh_res = await get_weather_forecast(15.85, 74.50, "medium", db, force_refresh=True)
+            assert refresh_res["refresh_status"] == "cooldown"
+            assert refresh_res["cooldown_remaining_seconds"] > 80000
+
+        assert call_count == 0
+    finally:
+        db.close()
+
+
+@pytest.mark.anyio
+async def test_weather_429_transient_retains_shorter_backoff():
+    """46. Transient 429 (hourly, concurrency, generic) retains shorter exponential backoff (<= 300s)."""
+    clear_weather_cooldown_trackers()
+
+    resp_transient = AsyncMock()
+    resp_transient.status_code = 429
+    resp_transient.headers = {}
+    resp_transient.json = lambda: {"reason": "Hourly API request limit exceeded"}
+
+    dur1 = _handle_429_response(resp_transient)
+    assert dur1 == 15.0
+    assert is_provider_daily_quota_active()[0] is False
+
+    dur2 = _handle_429_response(resp_transient)
+    assert dur2 == 30.0
+
+
+@pytest.mark.anyio
+async def test_weather_429_http_200_resets_daily_and_transient_cooldown(canned_weather_forecast):
+    """47. HTTP 200 resets both daily and transient cooldown state."""
+    db = SessionLocal()
+    try:
+        clear_weather_cooldown_trackers()
+
+        # Activate daily quota
+        resp_daily = AsyncMock()
+        resp_daily.status_code = 429
+        resp_daily.headers = {}
+        resp_daily.json = lambda: {"reason": "Daily API request limit exceeded"}
+        _handle_429_response(resp_daily)
+        assert is_provider_daily_quota_active()[0] is True
+        assert is_provider_429_active()[0] is True
+
+        from backend.app.services.weather_service import _reset_429_backoff_on_success
+        _reset_429_backoff_on_success()
+
+        assert is_provider_daily_quota_active()[0] is False
+        assert is_provider_429_active()[0] is False
+    finally:
+        db.close()
+
+
+@pytest.mark.anyio
+async def test_weather_429_malformed_bodies_do_not_crash():
+    """48. Malformed or non-JSON 429 response bodies do not crash and fall back to transient backoff."""
+    clear_weather_cooldown_trackers()
+
+    # 1. Non-dict JSON (array)
+    resp_list = AsyncMock()
+    resp_list.status_code = 429
+    resp_list.headers = {}
+    resp_list.json = lambda: ["error", "rate limit"]
+    dur1 = _handle_429_response(resp_list)
+    assert dur1 == 15.0
+
+    # 2. Corrupt JSON causing exception
+    resp_corrupt = AsyncMock()
+    resp_corrupt.status_code = 429
+    resp_corrupt.headers = {}
+    def raise_json_err():
+        raise ValueError("Invalid JSON")
+    resp_corrupt.json = raise_json_err
+    resp_corrupt.text = "<html><body>503/429 HTML Gateway</body></html>"
+    dur2 = _handle_429_response(resp_corrupt)
+    assert dur2 == 30.0
+
+    # 3. None body / empty text
+    resp_empty = AsyncMock()
+    resp_empty.status_code = 429
+    resp_empty.headers = {}
+    def raise_empty_err():
+        raise Exception("No JSON")
+    resp_empty.json = raise_empty_err
+    resp_empty.text = ""
+    dur3 = _handle_429_response(resp_empty)
+    assert dur3 == 60.0
 

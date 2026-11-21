@@ -25,6 +25,8 @@ CACHE_TTL_HOURS = 3
 COOLDOWN_SECONDS = 60
 INITIAL_429_BACKOFF_SECONDS = 15.0
 MAX_429_BACKOFF_SECONDS = 300.0
+DAILY_429_FALLBACK_COOLDOWN_SECONDS = 86400.0  # 24-hour conservative backoff for daily quota exhaustion
+MAX_DAILY_429_COOLDOWN_SECONDS = 86400.0
 GEOCODING_URL = "https://geocoding-api.open-meteo.com/v1/search"
 FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
 
@@ -33,9 +35,17 @@ _weather_location_locks: Dict[str, asyncio.Lock] = {}
 _weather_last_attempt: Dict[str, float] = {}
 
 # Provider-wide concurrency lock and 429 backoff tracking
+# NOTE ON PROCESS RESTART & EPHEMERAL STORAGE LIMITATION:
+# _provider_429_until and _provider_daily_429_until are in-memory process-local timers.
+# Because Render Free web services run on ephemeral container filesystems, in-memory cooldown
+# trackers AND the local SQLite database file are reset whenever the container spins down
+# (after 15 minutes of inactivity), restarts, or redeploys. Within a running container's
+# lifespan, successful forecasts are cached in SQLite with a 3-hour TTL (WeatherCache.fetched_at).
+# Neither in-memory rate-limit trackers nor cached forecasts survive container destruction.
 _open_meteo_provider_lock: Optional[asyncio.Lock] = None
 _provider_429_until: float = 0.0
 _provider_429_backoff: float = INITIAL_429_BACKOFF_SECONDS
+_provider_daily_429_until: float = 0.0
 
 
 def _get_provider_lock() -> asyncio.Lock:
@@ -53,15 +63,48 @@ def _get_weather_lock(location_key: str) -> asyncio.Lock:
     return _weather_location_locks[location_key]
 
 
-def is_provider_429_active() -> Tuple[bool, int]:
-    """Checks if provider-wide 429 cooldown is currently active.
+def _classify_429_reason(reason_text: str) -> str:
+    """Classifies an HTTP 429 error message into a specific quota/rate-limit category.
+
+    Categories:
+        - 'daily_quota_exceeded': Daily request quota reached (requires 24h or Retry-After backoff)
+        - 'hourly_quota_exceeded': Hourly request limit reached (transient backoff)
+        - 'minute_or_concurrency_limit': Minutely request or concurrent connection limit (transient backoff)
+        - 'unclassified_rate_limit': Generic or unparsed 429 response (transient backoff)
+    """
+    lower = reason_text.lower()
+    if "daily" in lower:
+        return "daily_quota_exceeded"
+    if "hourly" in lower:
+        return "hourly_quota_exceeded"
+    if "minute" in lower or "minutely" in lower or "concurrent" in lower or "concurrency" in lower:
+        return "minute_or_concurrency_limit"
+    return "unclassified_rate_limit"
+
+
+def is_provider_daily_quota_active() -> Tuple[bool, int]:
+    """Checks if provider-wide daily quota cooldown is currently active.
 
     Returns:
         Tuple of (is_active, remaining_seconds).
     """
     mono_now = time.monotonic()
-    if mono_now < _provider_429_until:
-        rem = max(1, int(round(_provider_429_until - mono_now)))
+    if mono_now < _provider_daily_429_until:
+        rem = max(1, int(round(_provider_daily_429_until - mono_now)))
+        return True, rem
+    return False, 0
+
+
+def is_provider_429_active() -> Tuple[bool, int]:
+    """Checks if any provider-wide 429 cooldown (transient or daily quota) is currently active.
+
+    Returns:
+        Tuple of (is_active, remaining_seconds).
+    """
+    mono_now = time.monotonic()
+    active_until = max(_provider_429_until, _provider_daily_429_until)
+    if mono_now < active_until:
+        rem = max(1, int(round(active_until - mono_now)))
         return True, rem
     return False, 0
 
@@ -69,44 +112,17 @@ def is_provider_429_active() -> Tuple[bool, int]:
 def _handle_429_response(resp: httpx.Response) -> float:
     """Handles Open-Meteo 429 rate limit response, parsing Retry-After and scheduling backoff.
 
-    Supports both numeric delay-seconds and RFC 7231 / RFC 9110 HTTP-date values.
+    Supports:
+        - Daily quota exhaustion (24-hour conservative fallback or Retry-After)
+        - Hourly, minutely, and concurrency limits (exponential backoff 15s-300s or Retry-After)
+        - Both numeric delay-seconds and RFC 7231 / RFC 9110 HTTP-date values
 
     Returns:
         Applied cooldown duration in seconds.
     """
-    global _provider_429_until, _provider_429_backoff
+    global _provider_429_until, _provider_429_backoff, _provider_daily_429_until
 
-    retry_after_hdr = resp.headers.get("Retry-After")
-    backoff_dur: Optional[float] = None
-    if retry_after_hdr:
-        raw_val = retry_after_hdr.strip()
-        # 1. Attempt numeric delay-seconds
-        try:
-            val = float(raw_val)
-            if val > 0:
-                backoff_dur = min(MAX_429_BACKOFF_SECONDS, max(1.0, val))
-        except (ValueError, TypeError):
-            # 2. Attempt RFC 7231 / RFC 9110 HTTP-date
-            try:
-                dt = parsedate_to_datetime(raw_val)
-                if dt.tzinfo is None:
-                    dt = dt.replace(tzinfo=timezone.utc)
-                else:
-                    dt = dt.astimezone(timezone.utc)
-                diff = (dt - datetime.now(timezone.utc)).total_seconds()
-                if diff > 0:
-                    backoff_dur = min(MAX_429_BACKOFF_SECONDS, max(1.0, diff))
-            except Exception:
-                backoff_dur = None
-
-    if backoff_dur is None:
-        backoff_dur = _provider_429_backoff
-        _provider_429_backoff = min(MAX_429_BACKOFF_SECONDS, _provider_429_backoff * 2.0)
-    else:
-        _provider_429_backoff = min(MAX_429_BACKOFF_SECONDS, max(INITIAL_429_BACKOFF_SECONDS, backoff_dur * 2.0))
-
-    _provider_429_until = time.monotonic() + backoff_dur
-
+    # 1. Safely extract diagnostic reason text from response body
     reason_text = "Rate limit exceeded"
     try:
         body = resp.json()
@@ -119,9 +135,65 @@ def _handle_429_response(resp: httpx.Response) -> float:
         if resp.text:
             reason_text = resp.text[:120].strip()
 
+    classification = _classify_429_reason(reason_text)
+
+    # 2. Parse Retry-After header if present (supports numeric seconds and HTTP-date)
+    retry_after_hdr = resp.headers.get("Retry-After")
+    parsed_retry_after: Optional[float] = None
+    if retry_after_hdr:
+        raw_val = retry_after_hdr.strip()
+        # Attempt numeric delay-seconds
+        try:
+            val = float(raw_val)
+            if val > 0:
+                parsed_retry_after = val
+        except (ValueError, TypeError):
+            # Attempt RFC 7231 / RFC 9110 HTTP-date
+            try:
+                dt = parsedate_to_datetime(raw_val)
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                else:
+                    dt = dt.astimezone(timezone.utc)
+                diff = (dt - datetime.now(timezone.utc)).total_seconds()
+                if diff > 0:
+                    parsed_retry_after = diff
+            except Exception:
+                parsed_retry_after = None
+
+    # 3. Apply cooldown based on classification
+    if classification == "daily_quota_exceeded":
+        if parsed_retry_after is not None:
+            backoff_dur = min(MAX_DAILY_429_COOLDOWN_SECONDS, max(1.0, parsed_retry_after))
+        else:
+            backoff_dur = DAILY_429_FALLBACK_COOLDOWN_SECONDS
+
+        _provider_daily_429_until = time.monotonic() + backoff_dur
+        _provider_429_until = _provider_daily_429_until
+
+        logger.warning(
+            "Open-Meteo daily API quota exhausted (classification: '%s', reason: '%s'). "
+            "Applying provider-wide daily cooldown of %d seconds.",
+            classification,
+            reason_text,
+            int(backoff_dur),
+        )
+        return backoff_dur
+
+    # 4. Transient 429 (hourly, minutely, concurrency, or unclassified)
+    if parsed_retry_after is not None:
+        backoff_dur = min(MAX_429_BACKOFF_SECONDS, max(1.0, parsed_retry_after))
+        _provider_429_backoff = min(MAX_429_BACKOFF_SECONDS, max(INITIAL_429_BACKOFF_SECONDS, backoff_dur * 2.0))
+    else:
+        backoff_dur = _provider_429_backoff
+        _provider_429_backoff = min(MAX_429_BACKOFF_SECONDS, _provider_429_backoff * 2.0)
+
+    _provider_429_until = time.monotonic() + backoff_dur
+
     logger.warning(
-        "Open-Meteo HTTP 429 rate limit encountered (reason: '%s'). "
-        "Applying provider-wide cooldown of %d seconds.",
+        "Open-Meteo HTTP 429 rate limit encountered (classification: '%s', reason: '%s'). "
+        "Applying provider-wide transient cooldown of %d seconds.",
+        classification,
         reason_text,
         int(backoff_dur),
     )
@@ -130,19 +202,21 @@ def _handle_429_response(resp: httpx.Response) -> float:
 
 def _reset_429_backoff_on_success() -> None:
     """Resets provider-level 429 backoff upon receiving successful HTTP 200 from Open-Meteo."""
-    global _provider_429_until, _provider_429_backoff
+    global _provider_429_until, _provider_429_backoff, _provider_daily_429_until
     _provider_429_until = 0.0
     _provider_429_backoff = INITIAL_429_BACKOFF_SECONDS
+    _provider_daily_429_until = 0.0
 
 
 def clear_weather_cooldown_trackers() -> None:
     """Utility for test suites to reset in-memory attempt timestamps, locks, and 429 backoff."""
-    global _open_meteo_provider_lock, _provider_429_until, _provider_429_backoff
+    global _open_meteo_provider_lock, _provider_429_until, _provider_429_backoff, _provider_daily_429_until
     _weather_last_attempt.clear()
     _weather_location_locks.clear()
     _open_meteo_provider_lock = None
     _provider_429_until = 0.0
     _provider_429_backoff = INITIAL_429_BACKOFF_SECONDS
+    _provider_daily_429_until = 0.0
 
 
 def normalize_utc_datetime(dt: Optional[Union[datetime, str]]) -> Optional[datetime]:
